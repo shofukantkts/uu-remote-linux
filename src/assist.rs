@@ -79,6 +79,33 @@ extern "C" {
     fn uu_assist_ui_take_command(arg: *mut libc::c_char, len: libc::size_t) -> libc::c_int;
     fn uu_assist_ui_close();
     fn uu_ui_set_problem(summary: *const libc::c_char, text: *const libc::c_char, notify: libc::c_int) -> libc::c_int;
+    fn uu_ui_update_session_latency(active: libc::c_int, rtt_ms: libc::c_double, viewer_delay_ms: libc::c_double, route_desc: *const libc::c_char, lost_packets: libc::c_ulonglong);
+}
+
+/// Updates the host window with live session latency metrics, route type, and packet loss.
+pub fn update_session_latency(
+    active: bool,
+    rtt_ms: Option<f64>,
+    viewer_delay_ms: Option<f64>,
+    route_desc: Option<&str>,
+    lost_packets: Option<u64>,
+) {
+    #[cfg(uu_gtk)] {
+        let route_c = route_desc.map(|s| std::ffi::CString::new(s).unwrap_or_default());
+        let route_ptr = route_c.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
+        unsafe {
+            uu_ui_update_session_latency(
+                i32::from(active),
+                rtt_ms.unwrap_or(-1.0),
+                viewer_delay_ms.unwrap_or(-1.0),
+                route_ptr,
+                lost_packets.unwrap_or(u64::MAX),
+            );
+        }
+    }
+    #[cfg(not(uu_gtk))] {
+        let _ = (active, rtt_ms, viewer_delay_ms, route_desc, lost_packets);
+    }
 }
 
 /// A problem only the person at the desktop can fix: a red line in the host window (`None` clears it)

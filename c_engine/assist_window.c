@@ -29,6 +29,14 @@ static pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t init_cond = PTHREAD_COND_INITIALIZER;
 static GtkWidget *window, *allow_switch, *id_label, *code_label, *eye_button, *share_button, *hint_label, *verify_combo, *note_label;
 static GtkWidget *refresh_items[5], *footer_label;
+// Session card: real network latency (RTT), viewer playout delay, route & packet loss.
+static GtkWidget *session_card, *session_status_badge, *session_stack;
+static GtkWidget *session_rtt_val, *session_viewer_val, *session_route_val, *session_loss_val;
+static int session_active;
+static double cur_rtt_ms = -1.0;
+static double cur_viewer_delay_ms = -1.0;
+static char cur_route_desc[64];
+static uint64_t cur_lost_packets;
 // Account card: QR login before sign-in, user info (+ logout) after.
 static GtkWidget *assist_card, *account_card, *account_stack, *qr_stack, *qr_image, *login_status, *user_label, *qr_refresh;
 /* Like the official client, a failed or timed-out QR stays until the user asks for a new one. */
@@ -174,7 +182,7 @@ static gboolean on_delete(GtkWidget *w, GdkEvent *e, gpointer d) {
 
 static void on_destroy(GtkWidget *w, gpointer d) {
     (void)w; (void)d;
-    window = code_label = NULL;
+    window = code_label = session_card = session_status_badge = session_stack = session_rtt_val = session_viewer_val = session_route_val = session_loss_val = NULL;
     atomic_store(&closed, 1);
     post(CMD_STOP);
     gtk_main_quit();
@@ -203,6 +211,133 @@ static void on_logout(GtkButton *b, gpointer d) {
         gtk_label_set_text(GTK_LABEL(user_label), L("正在退出登录…", "Signing out…"));
     }
     gtk_widget_destroy(dlg);
+}
+
+static const char *format_route_text(const char *route) {
+    if (!route || !route[0]) return L("检测中…", "Detecting…");
+    if (strcmp(route, "lan") == 0) return L("局域网直连 (LAN P2P)", "LAN direct (P2P)");
+    if (strcmp(route, "p2p") == 0) return L("NAT穿透直连 (P2P)", "NAT traversal (P2P)");
+    if (strcmp(route, "relay") == 0) return L("云端中继 (Relay)", "Relay server");
+    if (strcmp(route, "direct") == 0) return L("直连通道 (Direct)", "Direct path");
+    return route;
+}
+
+static void update_session_labels(void) {
+    if (!session_card) return;
+    if (session_status_badge) {
+        GtkStyleContext *ctx = gtk_widget_get_style_context(session_status_badge);
+        if (session_active) {
+            gtk_style_context_add_class(ctx, "remote");
+            gtk_label_set_text(GTK_LABEL(session_status_badge), L("● 远控已连接", "● Connected"));
+        } else {
+            gtk_style_context_remove_class(ctx, "remote");
+            gtk_label_set_text(GTK_LABEL(session_status_badge), L("等待连接", "Waiting for connection"));
+        }
+    }
+    if (session_stack) {
+        gtk_stack_set_visible_child_name(GTK_STACK(session_stack), session_active ? "active" : "empty");
+    }
+    if (session_rtt_val) {
+        if (cur_rtt_ms >= 0.0) {
+            gchar *str = g_strdup_printf("%.1f ms", cur_rtt_ms);
+            gtk_label_set_text(GTK_LABEL(session_rtt_val), str);
+            g_free(str);
+        } else {
+            gtk_label_set_text(GTK_LABEL(session_rtt_val), "-- ms");
+        }
+    }
+    if (session_viewer_val) {
+        if (cur_viewer_delay_ms >= 0.0) {
+            gchar *str = g_strdup_printf("%.1f ms", cur_viewer_delay_ms);
+            gtk_label_set_text(GTK_LABEL(session_viewer_val), str);
+            g_free(str);
+        } else {
+            gtk_label_set_text(GTK_LABEL(session_viewer_val), "-- ms");
+        }
+    }
+    if (session_route_val) {
+        gtk_label_set_text(GTK_LABEL(session_route_val), format_route_text(cur_route_desc));
+    }
+    if (session_loss_val) {
+        gchar *loss_str = g_strdup_printf(L("%llu 丢包", "%llu packets lost"), (unsigned long long)cur_lost_packets);
+        gtk_label_set_text(GTK_LABEL(session_loss_val), loss_str);
+        g_free(loss_str);
+    }
+}
+
+static GtkWidget *build_session_card(void) {
+    GtkWidget *card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(card), "card");
+
+    GtkWidget *header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(header), 16);
+    gtk_box_pack_start(GTK_BOX(header), label(L("远控会话与网络延迟", "Remote Session & Latency"), "heading"), FALSE, FALSE, 0);
+
+    session_status_badge = label(L("等待连接", "Waiting for connection"), "tag");
+    gtk_widget_set_valign(session_status_badge, GTK_ALIGN_CENTER);
+    gtk_box_pack_end(GTK_BOX(header), session_status_badge, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(card), header, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(card), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
+
+    session_stack = gtk_stack_new();
+    gtk_stack_set_transition_type(GTK_STACK(session_stack), GTK_STACK_TRANSITION_TYPE_CROSSFADE);
+
+    // Empty state
+    GtkWidget *empty_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(empty_box), 16);
+    GtkWidget *empty_hint = label(L("当前暂无活跃的远程控制会话。当手机或电脑控制端接入时，将在此实时呈现物理网络往返 (RTT)、控制端播放延迟与直连/中继链路。",
+                                   "No active remote session. Real physical RTT, viewer playout delay, and route status will appear here when a client connects."), "hint");
+    gtk_label_set_line_wrap(GTK_LABEL(empty_hint), TRUE);
+    gtk_box_pack_start(GTK_BOX(empty_box), empty_hint, FALSE, FALSE, 0);
+    gtk_stack_add_named(GTK_STACK(session_stack), empty_box, "empty");
+
+    // Active state: 3 columns
+    GtkWidget *active_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(active_box), 16);
+
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 36);
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 4);
+    gtk_grid_set_column_homogeneous(GTK_GRID(grid), TRUE);
+
+    // Col 0: Physical RTT
+    gtk_grid_attach(GTK_GRID(grid), label(L("物理网络往返 (RTT)", "Physical Network RTT"), "key"), 0, 0, 1, 1);
+    session_rtt_val = label("-- ms", "big");
+    gtk_style_context_add_class(gtk_widget_get_style_context(session_rtt_val), "online");
+    gtk_grid_attach(GTK_GRID(grid), session_rtt_val, 0, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), label(L("真实物理 ping 传输时延", "Real two-way ping latency"), "note"), 0, 2, 1, 1);
+
+    // Col 1: Viewer delay
+    gtk_grid_attach(GTK_GRID(grid), label(L("控制端播放延迟", "Viewer Playout Delay"), "key"), 1, 0, 1, 1);
+    session_viewer_val = label("-- ms", "big");
+    gtk_grid_attach(GTK_GRID(grid), session_viewer_val, 1, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), label(L("抗抖动排队与播放缓冲", "Jitter buffer & playout queuing"), "note"), 1, 2, 1, 1);
+
+    // Col 2: Route & Loss
+    gtk_grid_attach(GTK_GRID(grid), label(L("连接方式与链路质量", "Route & Link Quality"), "key"), 2, 0, 1, 1);
+    GtkWidget *col2_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    session_route_val = label(L("检测中…", "Detecting…"), "heading");
+    session_loss_val = label(L("0 丢包", "0 lost"), "note");
+    gtk_box_pack_start(GTK_BOX(col2_box), session_route_val, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(col2_box), session_loss_val, FALSE, FALSE, 0);
+    gtk_grid_attach(GTK_GRID(grid), col2_box, 2, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), label(L("传输链路通道类型", "Transmission link type"), "note"), 2, 2, 1, 1);
+
+    gtk_box_pack_start(GTK_BOX(active_box), grid, FALSE, FALSE, 0);
+
+    GtkWidget *tip = label(L("★ 说明：控制端界面显示的「网络延迟」(50ms+) 为网易 SDK 统计的「物理 RTT + 抗抖动缓冲 + 渲染排队」综合估算值；此处为物理往返真实延迟。",
+                             "★ Note: The client's displayed \"Network Latency\" (50ms+) includes physical RTT + jitter buffer + playout queuing; values here reflect true physical RTT."), "note");
+    gtk_label_set_line_wrap(GTK_LABEL(tip), TRUE);
+    gtk_widget_set_margin_top(tip, 6);
+    gtk_box_pack_start(GTK_BOX(active_box), tip, FALSE, FALSE, 0);
+
+    gtk_stack_add_named(GTK_STACK(session_stack), active_box, "active");
+
+    update_session_labels();
+
+    gtk_box_pack_start(GTK_BOX(card), session_stack, FALSE, FALSE, 0);
+    return card;
 }
 
 static GtkWidget *build_account_card(void) {
@@ -375,7 +510,7 @@ static void build_window(void) {
     window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(window), L("UU 远程 Linux 主机（非官方）", "UU Remote Linux host (unofficial)"));
     gtk_window_set_default_size(GTK_WINDOW(window), 760, -1);
-    gtk_window_set_resizable(GTK_WINDOW(window), FALSE);
+    gtk_window_set_resizable(GTK_WINDOW(window), TRUE);
     gtk_window_set_position(GTK_WINDOW(window), GTK_WIN_POS_CENTER);
     g_signal_connect(window, "delete-event", G_CALLBACK(on_delete), NULL);
     g_signal_connect(window, "destroy", G_CALLBACK(on_destroy), NULL);
@@ -486,6 +621,9 @@ static void build_window(void) {
 
     hint_label = label("", "hint");
     gtk_box_pack_start(GTK_BOX(root), hint_label, FALSE, FALSE, 0);
+    session_card = build_session_card();
+    gtk_widget_set_margin_top(session_card, 6);
+    gtk_box_pack_start(GTK_BOX(root), session_card, FALSE, FALSE, 0);
     account_card = build_account_card();
     gtk_widget_set_margin_top(account_card, 6);
     gtk_box_pack_start(GTK_BOX(root), account_card, FALSE, FALSE, 0);
@@ -507,6 +645,7 @@ static void build_window(void) {
     gtk_widget_show_all(gtk_bin_get_child(GTK_BIN(window)));
     gtk_widget_set_visible(assist_card, show_assist);
     gtk_widget_set_visible(hint_label, show_assist);
+    gtk_widget_set_visible(session_card, TRUE);
     gtk_widget_set_visible(account_card, show_account);
     pthread_mutex_lock(&problem_lock);
     gtk_label_set_text(GTK_LABEL(problem_label), problem_text ? problem_text : "");
@@ -539,6 +678,7 @@ static gboolean apply_sections(gpointer d) {
     (void)d;
     if (window) {
         gtk_widget_set_visible(assist_card, show_assist); gtk_widget_set_visible(hint_label, show_assist);
+        gtk_widget_set_visible(session_card, TRUE);
         gtk_widget_set_visible(account_card, show_account);
     }
     return G_SOURCE_REMOVE;
@@ -741,6 +881,50 @@ int uu_ui_set_problem(const char *summary, const char *text, int notify) {
     uu_assist_ui_present();
     return 1;
 }
+
+// Session latency telemetry update. active: 1 connected, 0 disconnected.
+typedef struct {
+    int active;
+    double rtt_ms;
+    double viewer_delay_ms;
+    char *route_desc;
+    uint64_t lost_packets;
+} SessionUpdate;
+
+static gboolean apply_session_update(gpointer data) {
+    SessionUpdate *u = data;
+    if (window && session_card) {
+        if (!u->active) {
+            session_active = 0;
+            cur_rtt_ms = -1.0;
+            cur_viewer_delay_ms = -1.0;
+            cur_route_desc[0] = '\0';
+            cur_lost_packets = 0;
+        } else {
+            session_active = 1;
+            if (u->rtt_ms >= 0.0) cur_rtt_ms = u->rtt_ms;
+            if (u->viewer_delay_ms >= 0.0) cur_viewer_delay_ms = u->viewer_delay_ms;
+            if (u->route_desc && u->route_desc[0]) g_strlcpy(cur_route_desc, u->route_desc, sizeof(cur_route_desc));
+            if (u->lost_packets != (uint64_t)-1) cur_lost_packets = u->lost_packets;
+        }
+        update_session_labels();
+    }
+    g_free(u->route_desc);
+    g_free(u);
+    return G_SOURCE_REMOVE;
+}
+
+void uu_ui_update_session_latency(int active, double rtt_ms, double viewer_delay_ms, const char *route_desc, uint64_t lost_packets) {
+    if (!ui_started || init_state != 1 || atomic_load(&closed)) return;
+    SessionUpdate *u = g_new0(SessionUpdate, 1);
+    u->active = active;
+    u->rtt_ms = rtt_ms;
+    u->viewer_delay_ms = viewer_delay_ms;
+    u->route_desc = route_desc ? g_strdup(route_desc) : NULL;
+    u->lost_packets = lost_packets;
+    g_idle_add(apply_session_update, u);
+}
+
 void uu_login_ui_set_done(const char *text) { uu_ui_set_user(text); }
 int uu_login_ui_closed(void) { return atomic_load(&closed); }
 void uu_login_ui_close(void) { uu_assist_ui_close(); }

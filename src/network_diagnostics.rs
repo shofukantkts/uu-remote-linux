@@ -81,7 +81,7 @@ static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub fn start(peer: Weak<RTCPeerConnection>) {
     let session = SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut rate = RateCounter::default();
         let mut last_path = None;
@@ -97,6 +97,18 @@ pub fn start(peer: Weak<RTCPeerConnection>) {
                 continue;
             }
             let Some(path) = selected_path(&pc).await else { continue };
+            let route_tag = if path.route == "direct" {
+                if path.local.kind == "host" && path.remote.kind == "host" {
+                    "lan"
+                } else {
+                    "p2p"
+                }
+            } else if path.route == "relay" {
+                "relay"
+            } else {
+                "direct"
+            };
+            crate::assist::update_session_latency(true, None, None, Some(route_tag), None);
             let report = pc.get_stats().await;
             let (mut sent, mut received) = (0u64, 0u64);
             for stats in report.reports.values() {
