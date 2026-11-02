@@ -347,6 +347,11 @@ impl WebRtcSession {
                     if state==RTCPeerConnectionState::Connected {session.connected();}
                     if matches!(state,RTCPeerConnectionState::Closed|RTCPeerConnectionState::Failed|RTCPeerConnectionState::Disconnected) {session.disconnected();}
                 }
+                if state == RTCPeerConnectionState::Connected {
+                    crate::assist::update_session_latency(true, None, None, None, None);
+                } else if matches!(state, RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed | RTCPeerConnectionState::Disconnected) {
+                    crate::assist::update_session_latency(false, None, None, None, None);
+                }
                 if state == RTCPeerConnectionState::Connected && !notified.swap(true, std::sync::atomic::Ordering::AcqRel) {
                     tokio::spawn(async move {
                     let ctx = ctx.lock().await.clone();
@@ -409,14 +414,19 @@ impl WebRtcSession {
                     }
                     if let Some(report) = packet.as_any().downcast_ref::<webrtc::rtcp::receiver_report::ReceiverReport>() {
                         reports += 1;
-                        if reports == 1 || reports % 10 == 0 {
-                            for r in &report.reports {
-                                let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-                                let ntp=(((now.as_secs()+2_208_988_800)&0xffff)<<16) as u32 | ((u64::from(now.subsec_nanos())*65536/1_000_000_000) as u32);
-                                let elapsed=ntp.wrapping_sub(r.last_sender_report).wrapping_sub(r.delay);
-                                let rtt=if r.last_sender_report!=0&&elapsed<65536*30 {Some(f64::from(elapsed)*1000./65536.)}else{None};
+                        for r in &report.reports {
+                            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                            let ntp=(((now.as_secs()+2_208_988_800)&0xffff)<<16) as u32 | ((u64::from(now.subsec_nanos())*65536/1_000_000_000) as u32);
+                            let elapsed=ntp.wrapping_sub(r.last_sender_report).wrapping_sub(r.delay);
+                            let rtt=if r.last_sender_report!=0&&elapsed<65536*30 {Some(f64::from(elapsed)*1000./65536.)}else{None};
+                            if reports == 1 || reports % 10 == 0 {
                                 log::info!("Video receiver report: ssrc={} last_sequence={} lost={} fraction_lost={} rtcp_rtt_ms={:?}",r.ssrc,r.last_sequence_number,r.total_lost,r.fraction_lost,rtt);
                             }
+                            if let Some(rtt_ms) = rtt {
+                                crate::assist::update_session_latency(true, Some(rtt_ms), None, None, Some(r.total_lost as u64));
+                            }
+                        }
+                        if reports == 1 || reports % 10 == 0 {
                             log::info!("Video feedback totals: nack_packets={} pli={} fir={}",feedback_counts.nack_packets,feedback_counts.pli,feedback_counts.fir);
                         }
                     }
@@ -1566,6 +1576,12 @@ impl WebRtcSession {
                                             }
                                         }
                                         log::info!("Viewer delay/frame numeric metrics: {:?}",nums);
+                                        let viewer_delay = nums.iter()
+                                            .find(|(k, _)| k.ends_with("avg_delay_ms_interval") || k.ends_with("avg_jitter_buffer_ms_interval") || k.ends_with("avg_current_delay_ms_interval"))
+                                            .map(|(_, v)| *v);
+                                        if let Some(delay) = viewer_delay {
+                                            crate::assist::update_session_latency(true, None, Some(delay), None, None);
+                                        }
                                     }
 
                                     // 检查是否有 ping 或握手请求并回应
